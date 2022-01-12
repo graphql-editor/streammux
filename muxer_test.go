@@ -1,21 +1,54 @@
 package streammux_test
 
 import (
-	"encoding/binary"
+	"bytes"
 	"fmt"
 	"io"
 	"math/rand"
 	"sync"
 	"testing"
 
-	streammux "github.com/graphql-editor/io-pipe"
+	"github.com/graphql-editor/streammux"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
 
 var (
 	staticPayload = []byte{0, 1, 2, 3, 4, 5, 6, 7}
+	byteOrder     = streammux.ByteOrder
 )
+
+func getID(p []byte) uint16 {
+	return byteOrder.Uint16(p[:2])
+}
+
+func setID(p []byte, id uint16) {
+	byteOrder.PutUint16(p[:2], id)
+}
+
+func getFlags(p []byte) uint16 {
+	return byteOrder.Uint16(p[2:4])
+}
+
+func setFlags(p []byte, flags uint16) {
+	byteOrder.PutUint16(p[2:4], flags)
+}
+
+func getSize(p []byte) uint32 {
+	return byteOrder.Uint32(p[4:8])
+}
+
+func setSize(p []byte, size uint32) {
+	byteOrder.PutUint32(p[4:8], size)
+}
+
+func getIDcap(p []byte) uint16 {
+	return byteOrder.Uint16(p[8:10])
+}
+
+func setIDCap(p []byte, idcap uint16) {
+	byteOrder.PutUint16(p[8:10], idcap)
+}
 
 type mockReaderResp struct {
 	header []byte
@@ -66,8 +99,12 @@ func (i *mockRW) Read(p []byte) (int, error) {
 
 func (i *mockRW) Write(p []byte) (int, error) {
 	if i.writeResp == nil {
-		i.writeResp = &mockReaderResp{
-			header: append([]byte{}, p...),
+		s := getSize(p)
+		if s > 0 {
+			i.writeResp = &mockReaderResp{
+				header: append([]byte{}, p...),
+			}
+			setFlags(i.writeResp.header, uint16(2))
 		}
 		i.Called(p)
 		return len(p), nil
@@ -82,13 +119,25 @@ func (i *mockRW) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func headerMatcher(header []byte, dataLen int) func([]byte) bool {
+	return func(b []byte) bool {
+		flags := getFlags(b)
+		size := getSize(b)
+		return len(b) == 16 &&
+			bytes.Equal(header[:2], b[:2]) &&
+			bytes.Equal(header[8:], b[8:]) &&
+			(flags == 0 || flags == 2) &&
+			size >= 0 && size <= uint32(dataLen)
+	}
+}
+
 func TestMuxerDoByte(t *testing.T) {
 	count := 2048
 	maxID := 128
 	var expected [][]byte
 	for i := uint64(0); i < uint64(count); i++ {
 		var buf [8]byte
-		binary.LittleEndian.PutUint64(buf[:], i)
+		byteOrder.PutUint64(buf[:], i)
 		expected = append(expected, buf[:])
 	}
 	mio := mockRW{
@@ -97,11 +146,12 @@ func TestMuxerDoByte(t *testing.T) {
 	// setup header calls
 	for i := 1; i < maxID; i++ {
 		header := make([]byte, 16)
-		binary.LittleEndian.PutUint16(header[:2], uint16(i))
-		binary.LittleEndian.PutUint32(header[4:8], 8)
-		binary.LittleEndian.PutUint16(header[8:10], 128)
-		mio.On("Write", header)
-		mio.On("Read", header)
+		setID(header, uint16(i))
+		setFlags(header, 2)
+		setSize(header, 8)
+		setIDCap(header, 128)
+		mio.On("Write", mock.MatchedBy(headerMatcher(header, 8)))
+		mio.On("Read", mock.MatchedBy(headerMatcher(header, 8)))
 	}
 
 	// setup body calls
@@ -156,32 +206,27 @@ type noopRW struct {
 }
 
 func (n *noopRW) Read(p []byte) (int, error) {
-	_ = p[7]
-	if n.rpayload {
-		n.rpayload = false
+	n.rpayload = !n.rpayload
+	if !n.rpayload {
 		return len(staticPayload), nil
 	}
-	id, ok := <-n.idChan
-	if !ok {
-		return 0, io.EOF
-	}
-	p[4] = 8
-	binary.LittleEndian.PutUint16(p[:2], id)
-	binary.LittleEndian.PutUint32(p[4:], uint32(len(staticPayload)))
-	n.rpayload = true
+	id := <-n.idChan
+	setID(p, id)
+	setFlags(p, 2)
+	setSize(p, uint32(len(staticPayload)))
 	return streammux.HeaderSize, nil
 }
 
 func (n *noopRW) Write(p []byte) (int, error) {
 	if n.wpayload {
 		n.wpayload = false
-		return len(p), nil
+	} else {
+		n.wpayload = getSize(p) > 0
+		if getFlags(p)&0x2 != 0 {
+			n.idChan <- getID(p)
+		}
 	}
-	_ = p[7]
-	id := binary.LittleEndian.Uint16(p[:2])
-	n.idChan <- id
-	n.wpayload = true
-	return streammux.HeaderSize, nil
+	return len(p), nil
 }
 
 func BenchmarkMuxerDoByte(b *testing.B) {
@@ -197,6 +242,69 @@ func BenchmarkMuxerDoByte(b *testing.B) {
 			m.DoByte(staticPayload)
 		}
 	})
+}
+
+type byteReader []byte
+
+func (b *byteReader) Read(p []byte) (int, error) {
+	return copy(p, staticPayload), io.EOF
+}
+
+func BenchmarkDoParallel(b *testing.B) {
+	rw := noopRW{
+		idChan: make(chan uint16, 64),
+	}
+	m := streammux.Muxer{
+		Reader: &rw,
+		Writer: &rw,
+	}
+	r := (*byteReader)(&staticPayload)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			m.Do(io.Discard, r)
+		}
+	})
+}
+
+type syncNoopRW struct {
+	id       uint16
+	wpayload bool
+	rpayload bool
+}
+
+func (n *syncNoopRW) Read(p []byte) (int, error) {
+	n.rpayload = !n.rpayload
+	if !n.rpayload {
+		return len(staticPayload), nil
+	}
+	setID(p, n.id)
+	setFlags(p, 2)
+	setSize(p, uint32(len(staticPayload)))
+	return streammux.HeaderSize, nil
+}
+
+func (n *syncNoopRW) Write(p []byte) (int, error) {
+	if n.wpayload {
+		n.wpayload = false
+	} else {
+		n.wpayload = getSize(p) > 0
+		if getFlags(p)&0x2 != 0 {
+			n.id = getID(p)
+		}
+	}
+	return len(p), nil
+}
+
+func BenchmarkDoSync(b *testing.B) {
+	rw := syncNoopRW{}
+	m := streammux.Muxer{
+		Reader: &rw,
+		Writer: &rw,
+	}
+	r := (*byteReader)(&staticPayload)
+	for i := 0; i < b.N; i++ {
+		m.Do(io.Discard, r)
+	}
 }
 
 func ExampleMuxer_bytePipe() {
